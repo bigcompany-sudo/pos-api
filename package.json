@@ -1,0 +1,11 @@
+{
+  "name": "pos-host-api",
+  "version": "1.0.0",
+  "main": "pos.js",
+  "scripts": { "start": "node pos.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "express": "^4.19.2",
+    "tronweb": "^6.0.0"
+  }
+}
