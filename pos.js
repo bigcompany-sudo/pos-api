@@ -34,6 +34,16 @@ app.post('/cards', auth, (req,res)=>{
   save(); res.json({ok:true,card_no,balance:balance||0});
 });
 app.get('/cards', auth,(_,res)=>res.json(db.cards));
+app.patch('/cards/:no', auth,(req,res)=>{
+  const c=db.cards.find(x=>x.card_no===req.params.no);
+  if(!c) return res.status(404).json({error:'card not found'});
+  if(req.body.status) c.status=req.body.status;
+  if(req.body.balance!=null) c.balance=req.body.balance;
+  save(); res.json({ok:true,card:c});
+});
+app.delete('/cards/:no', auth,(req,res)=>{
+  db.cards=db.cards.filter(x=>x.card_no!==req.params.no); save(); res.json({ok:true});
+});
 
 app.post('/preauth', auth,(req,res)=>{
   const {card_no,amount,protocol='101.1'}=req.body;
@@ -55,13 +65,24 @@ app.post('/complete', auth, async(req,res)=>{
   if(!t) return res.status(404).json({error:'ref not found'});
   if(t.status==='completed') return res.status(400).json({error:'already completed'});
   if(t.approval_code!==approval_code) return res.status(400).json({error:'wrong approval code'});
-  t.status='completed'; t.completed_at=new Date().toISOString(); save();
+  t.status='completed'; t.completed_at=new Date().toISOString();
   let txid=null;
   if(tronWeb){ try{ txid=await sendUSDT(USDT_WALLET,t.amount);}catch(e){txid='ERR:'+e.message;} }
+  t.txid=txid; save();
   res.json({step:'COMPLETE',released:true,ref,amount_usdt:t.amount,wallet:USDT_WALLET,network:'TRC20',txid});
 });
 
 app.get('/transactions', auth,(_,res)=>res.json(db.txns.slice().reverse()));
+app.get('/stats', auth,(_,res)=>{
+  const done=db.txns.filter(t=>t.status==='completed');
+  res.json({
+    cards:db.cards.length, txns:db.txns.length, completed:done.length,
+    pending:db.txns.filter(t=>t.status==='pending').length,
+    settled_usdt:done.reduce((s,t)=>s+t.amount,0),
+    pending_usdt:db.txns.filter(t=>t.status==='pending').reduce((s,t)=>s+t.amount,0),
+    wallet:USDT_WALLET, hot_wallet:!!HOT_PK
+  });
+});
 app.get('/health',(_,res)=>res.json({ok:true,protocols:['101.1','101.2','101.3','201.3'],wallet:USDT_WALLET}));
 
 const HTML = `<!doctype html>
@@ -105,31 +126,35 @@ body{background:#05080b;color:var(--txt);font-family:-apple-system,BlinkMacSyste
 .field input{width:100%;background:var(--surface);border:1px solid var(--line);color:var(--txt);padding:13px;border-radius:12px;font-size:16px;font-family:inherit}
 .field input:focus{outline:0;border-color:var(--accent)}
 .row{display:flex;gap:10px}.row>*{flex:1}
+.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin-bottom:6px}
+.stat{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:12px;text-align:center}
+.stat b{display:block;font-size:20px;color:var(--accent)}
+.stat span{font-size:10px;color:var(--muted);letter-spacing:.5px}
 .nav{display:flex;background:linear-gradient(0deg,#0c131b,#101823);border-top:1px solid var(--line)}
-.nav button{flex:1;background:0;border:0;color:var(--muted);padding:12px 0 14px;font-size:11px;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:4px}
+.nav button{flex:1;background:0;border:0;color:var(--muted);padding:11px 0 13px;font-size:10px;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:4px}
 .nav button.on{color:var(--accent)}
-.nav span{font-size:11px}
 .sheet{position:absolute;inset:0;background:rgba(4,7,10,.75);backdrop-filter:blur(3px);display:none;align-items:flex-end;z-index:20}
 .sheet.on{display:flex}
 .sheetbox{width:100%;background:var(--surface);border-top:1px solid var(--line);border-radius:24px 24px 0 0;padding:20px;max-height:92%;overflow-y:auto;animation:up .3s}
 @keyframes up{from{transform:translateY(40px);opacity:.5}}
 .grab{width:40px;height:4px;background:var(--line);border-radius:4px;margin:0 auto 16px}
-.sheetbox h3{margin:0 0 4px;font-size:17px}
+.sheetbox h3{margin:0 0 4px;font-size:17px;word-break:break-all}
 .sheetbox p.sub{margin:0 0 16px;color:var(--muted);font-size:12px}
 .list{display:flex;flex-direction:column;gap:9px}
-.item{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:13px}
+.item{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:13px;cursor:pointer}
 .item .t{font-size:14px;font-weight:600;letter-spacing:.5px}
 .item .s{font-size:12px;color:var(--muted);margin-top:3px}
 .badge{font-size:10px;padding:3px 8px;border-radius:20px;font-weight:700;letter-spacing:.5px}
 .badge.ok{background:rgba(0,214,143,.15);color:var(--accent)}
 .badge.pend{background:rgba(255,176,32,.15);color:var(--warn)}
+.badge.blk{background:rgba(255,84,112,.15);color:var(--danger)}
 .spin{width:52px;height:52px;border:4px solid var(--line);border-top-color:var(--accent);border-radius:50%;margin:6px auto 16px;animation:sp .8s linear infinite}
 @keyframes sp{to{transform:rotate(360deg)}}
 .center{text-align:center}
 .bigcheck{width:76px;height:76px;border-radius:50%;background:rgba(0,214,143,.12);border:2px solid var(--accent);display:flex;align-items:center;justify-content:center;margin:6px auto 14px;font-size:38px;color:var(--accent);animation:pop .4s}
 @keyframes pop{from{transform:scale(.5);opacity:0}}
-.kv{display:flex;justify-content:space-between;font-size:13px;padding:9px 0;border-bottom:1px dashed var(--line)}
-.kv span{color:var(--muted)}.kv b{color:var(--txt);font-weight:600}
+.kv{display:flex;justify-content:space-between;gap:10px;font-size:13px;padding:9px 0;border-bottom:1px dashed var(--line)}
+.kv span{color:var(--muted);flex-shrink:0}.kv b{color:var(--txt);font-weight:600;text-align:right;word-break:break-all}
 .toast{position:absolute;top:74px;left:50%;transform:translateX(-50%);background:#1c2a1f;color:var(--accent);border:1px solid var(--accent);padding:9px 16px;border-radius:20px;font-size:13px;z-index:50;display:none}
 .toast.err{background:#2a1a1e;color:var(--danger);border-color:var(--danger)}
 h3.sec{font-size:12px;letter-spacing:1px;color:var(--muted);margin:18px 0 10px}
@@ -158,18 +183,32 @@ h3.sec{font-size:12px;letter-spacing:1px;color:var(--muted);margin:18px 0 10px}
       <div class=row><div class=field><label>HOLDER</label><input id=nholder value="TEST USER"></div>
       <div class=field><label>BALANCE</label><input id=nbal value="1000" inputmode=numeric></div></div>
       <button class="btn blue" onclick=addCard()>+ ADD CARD</button>
-      <h3 class=sec>CARDS ON FILE</h3>
+      <h3 class=sec>CARDS ON FILE <span style="color:var(--accent)">(tap to manage)</span></h3>
       <div class=list id=cards></div>
     </section>
     <section class=screen id=scr-txns>
       <h3 class=sec>RECENT TRANSACTIONS</h3>
       <div class=list id=txns></div>
     </section>
+    <section class=screen id=scr-settle>
+      <div class=amtcard><div class=amtlbl>SETTLED · USDT</div><div class=amt id=stSettled>0.00</div></div>
+      <div class=grid3>
+        <div class=stat><b id=stPending>0</b><span>PENDING</span></div>
+        <div class=stat><b id=stDone>0</b><span>SETTLED</span></div>
+        <div class=stat><b id=stCards>0</b><span>CARDS</span></div>
+      </div>
+      <h3 class=sec>SETTLEMENT WALLET · TRC20</h3>
+      <div class=item onclick=copyWallet()><div class=s>tap to copy</div><div class=t id=stWal style="word-break:break-all;font-size:12px"></div></div>
+      <div class=item><div class=t id=stHot></div><div class=s>on-chain payout engine</div></div>
+      <h3 class=sec>SETTLED TRANSACTIONS</h3>
+      <div class=list id=settled></div>
+    </section>
   </div>
   <nav class=nav>
     <button class=on data-tab=sale onclick=tab('sale')>▣<span>SALE</span></button>
     <button data-tab=cards onclick=tab('cards')>▤<span>CARDS</span></button>
     <button data-tab=txns onclick=tab('txns')>≡<span>TXNS</span></button>
+    <button data-tab=settle onclick=tab('settle')>◎<span>SETTLE</span></button>
   </nav>
   <div class=sheet id=sheetCard><div class=sheetbox>
     <div class=grab></div><h3>Present Card</h3><p class=sub id=cardAmt></p>
@@ -177,7 +216,7 @@ h3.sec{font-size:12px;letter-spacing:1px;color:var(--muted);margin:18px 0 10px}
     <div class=row><div class=field><label>EXP</label><input id=exp value="12/27"></div>
     <div class=field><label>CVV</label><input id=cvv value="123" inputmode=numeric></div></div>
     <button class="btn primary" onclick=authorize()>AUTHORIZE</button>
-    <button class="btn ghost" style="margin-top:9px" onclick=closeCard()>Cancel</button>
+    <button class="btn ghost" style="margin-top:9px" onclick=hide('sheetCard')>Cancel</button>
   </div></div>
   <div class=sheet id=sheetProc><div class=sheetbox><div class=spin></div><div class=center>AUTHORIZING…</div></div></div>
   <div class=sheet id=sheetOk><div class=sheetbox>
@@ -192,15 +231,27 @@ h3.sec{font-size:12px;letter-spacing:1px;color:var(--muted);margin:18px 0 10px}
     <div class=kv><span>REF</span><b id=rcRef></b></div>
     <div class=kv><span>AMOUNT</span><b id=rcAmt></b></div>
     <div class=kv><span>WALLET</span><b id=rcWal></b></div>
-    <div class=kv><span>TXID</span><b id=rcTx style="word-break:break-all;font-size:11px"></b></div>
+    <div class=kv><span>TXID</span><b id=rcTx></b></div>
     <button class="btn primary" style="margin-top:14px" onclick=newSale()>NEW SALE</button>
+  </div></div>
+  <div class=sheet id=sheetTxn><div class=sheetbox>
+    <div class=grab></div><h3>Transaction</h3><p class=sub id=txSub></p>
+    <div id=txBody></div>
+    <button class="btn ghost" style="margin-top:14px" onclick=hide('sheetTxn')>Close</button>
+  </div></div>
+  <div class=sheet id=sheetCardDet><div class=sheetbox>
+    <div class=grab></div><h3 id=cdNo></h3><p class=sub id=cdSub></p>
+    <div class=field><label>SET BALANCE (USDT)</label><input id=cdBal inputmode=numeric></div>
+    <button class="btn blue" onclick=cdTopup()>SAVE BALANCE</button>
+    <button class="btn ghost" style="margin-top:9px" id=cdBlock onclick=cdToggle()>BLOCK</button>
+    <button class="btn ghost" style="margin-top:9px;color:var(--danger);border-color:var(--danger)" onclick=cdDelete()>DELETE CARD</button>
   </div></div>
 </div>
 <script>
 const KEY='super-secret-key-change-this';
 const H={'Content-Type':'application/json','X-API-KEY':KEY};
 const $=id=>document.getElementById(id);
-let amount='0', proto='101.1', ref=null;
+let amount='0', proto='101.1', ref=null, cdNo=null, TXCACHE=[], CARD_CACHE=[];
 const keys=['1','2','3','4','5','6','7','8','9','.','0','\u232b'];
 $('pad').innerHTML=keys.map(k=>'<button class=key onclick=press(\''+k+'\')>'+k+'</button>').join('');
 function press(k){
@@ -213,11 +264,11 @@ $('chips').addEventListener('click',e=>{const b=e.target.closest('.chip');if(!b)
   document.querySelectorAll('.chip').forEach(c=>c.classList.remove('on'));b.classList.add('on');proto=b.dataset.p;});
 function tab(t){document.querySelectorAll('.screen').forEach(s=>s.classList.remove('on'));$('scr-'+t).classList.add('on');
   document.querySelectorAll('.nav button').forEach(b=>b.classList.toggle('on',b.dataset.tab===t));
-  if(t==='cards')loadCards(); if(t==='txns')loadTxns();}
+  if(t==='cards')loadCards(); if(t==='txns')loadTxns(); if(t==='settle')loadStats();}
 function toast(m,err){const t=$('toast');t.textContent=m;t.className='toast'+(err?' err':'');t.style.display='block';setTimeout(()=>t.style.display='none',2600);}
 const show=id=>$(id).classList.add('on'); const hide=id=>$(id).classList.remove('on');
+const kv=(k,v)=>'<div class=kv><span>'+k+'</span><b>'+v+'</b></div>';
 function openCard(){ if(parseFloat(amount)<=0)return toast('Enter amount',1); $('cardAmt').textContent='Charging '+amount+' USDT · '+proto; show('sheetCard'); }
-function closeCard(){hide('sheetCard');}
 async function authorize(){
   hide('sheetCard'); show('sheetProc');
   try{
@@ -239,21 +290,19 @@ async function settle(){
     show('sheetRc');
   }catch(e){toast('network error',1);}
 }
-function newSale(){hide('sheetRc');amount='0';$('amtDisp').textContent='0.00';tab('sale');loadTxns();}
+function newSale(){hide('sheetRc');amount='0';$('amtDisp').textContent='0.00';tab('sale');}
 async function addCard(){
   const r=await fetch('/cards',{method:'POST',headers:H,body:JSON.stringify({card_no:$('nc').value,exp:$('nexp').value,cvv:$('ncvv').value,holder:$('nholder').value,balance:parseFloat($('nbal').value)})});
   const d=await r.json(); toast(d.error?d.error:'Card added',!!d.error); if(!d.error)loadCards();
 }
 async function loadCards(){
   const d=await fetch('/cards',{headers:H}).then(r=>r.json());
-  $('cards').innerHTML=(Array.isArray(d)&&d.length?d:[]).map(c=>'<div class=item><div class=t>'+c.card_no+'</div><div class=s>'+c.exp+' · bal '+c.balance+' USDT</div><span class="badge ok" style="margin-top:7px;display:inline-block">'+c.status+'</span></div>').join('')||'<div class=item><div class=s>No cards yet</div></div>';
+  CARD_CACHE=Array.isArray(d)?d:[];
+  $('cards').innerHTML=CARD_CACHE.map(c=>'<div class=item onclick="openCardDet(\''+c.card_no+'\')"><div style="display:flex;justify-content:space-between"><div class=t>'+c.card_no+'</div><span class="badge '+(c.status==='active'?'ok':'blk')+'">'+c.status+'</span></div><div class=s>'+c.exp+' · bal '+c.balance+' USDT</div></div>').join('')||'<div class=item><div class=s>No cards yet</div></div>';
 }
-async function loadTxns(){
-  const d=await fetch('/transactions',{headers:H}).then(r=>r.json());
-  $('txns').innerHTML=(Array.isArray(d)&&d.length?d:[]).slice(0,20).map(t=>'<div class=item><div style="display:flex;justify-content:space-between"><div class=t>'+t.amount+' USDT</div><span class="badge '+(t.status==='completed'?'ok':'pend')+'">'+t.status+'</span></div><div class=s>'+t.ref+' · '+t.protocol+'</div></div>').join('')||'<div class=item><div class=s>No transactions</div></div>';
+function openCardDet(no){
+  const c=CARD_CACHE.find(x=>x.card_no===no); if(!c)return;
+  cdNo=no; $('cdNo').textContent=no; $('cdSub').textContent=c.exp+' · holder '+(c.holder||'-')+' · status '+c.status;
+  $('cdBal').value=c.balance; $('cdBlock').textContent=c.status==='active'?'BLOCK CARD':'UNBLOCK CARD'; show('sheetCardDet');
 }
-loadCards();loadTxns();
-</script></body></html>`;
-app.get('/',(_,res)=>res.send(HTML));
-
-app.listen(PORT,()=>console.log('POS live on '+PORT));
+async function cdTopup(){ await fetch('/cards/'+cdNo,{meth
