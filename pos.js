@@ -66,29 +66,71 @@ app.get('/health',(_,res)=>res.json({ok:true,protocols:['101.1','101.2','101.3',
 
 const HTML = `<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1">
 <title>POS 101.1</title><style>
-body{background:#000;color:#0f0;font-family:monospace;padding:14px;font-size:15px}
-h2{border-bottom:1px solid #0f0;padding-bottom:6px}
-input,select,button{background:#000;color:#0f0;border:1px solid #0f0;padding:9px;font-family:monospace;width:100%;box-sizing:border-box;margin:5px 0;font-size:15px}
+*{box-sizing:border-box}
+body{background:#000;color:#0f0;font-family:monospace;padding:14px;font-size:15px;margin:0}
+h2{border-bottom:1px solid #0f0;padding-bottom:6px;margin-top:18px}
+input,select,button{background:#000;color:#0f0;border:1px solid #0f0;padding:9px;font-family:monospace;width:100%;margin:5px 0;font-size:15px}
 button{cursor:pointer}button:active{background:#0f0;color:#000}
+.row{display:flex;gap:6px}.row>*{flex:1}
 pre{white-space:pre-wrap;font-size:12px;border-top:1px dashed #0f0;padding-top:8px}
-.hidden{display:none}
+.hidden{display:none}.err{color:#f55}.small{font-size:12px;color:#0a0}
+.card{border:1px solid #0a0;padding:6px;margin:4px 0;font-size:12px}
 </style></head><body>
 <h2>► PROTOCOL POS</h2>
 <div id=s1>
 <label>CARD</label><input id=card value="4111111111111111">
-<label>EXP</label><input id=exp value="12/27">
-<label>CVV</label><input id=cvv value="123">
+<div class=row><div><label>EXP</label><input id=exp value="12/27"></div>
+<div><label>CVV</label><input id=cvv value="123"></div></div>
 <label>AMOUNT</label><input id=amt value="100">
 <label>PROTOCOL</label><select id=proto><option>101.1</option><option>201.3</option></select>
 <button onclick=pre()>PRE-AUTH</button></div>
-<div id=s2 class=hidden><label>APPROVAL CODE</label><input id=code>
+<div id=s2 class=hidden><label>APPROVAL CODE (auto)</label><input id=code>
 <button onclick=comp()>COMPLETE</button></div>
+
+<h2>► ADD CARD</h2>
+<label>CARD NO</label><input id=nc placeholder="4111111111111111">
+<div class=row><div><label>EXP</label><input id=nexp placeholder="12/27"></div>
+<div><label>CVV</label><input id=ncvv></div></div>
+<div class=row><div><label>HOLDER</label><input id=nholder></div>
+<div><label>BALANCE</label><input id=nbal value="1000"></div></div>
+<button onclick=addCard()>+ ADD CARD</button>
+
+<h2>► CARDS <span class=small onclick=loadCards()>[refresh]</span></h2>
+<div id=cards></div>
+<h2>► TRANSACTIONS <span class=small onclick=loadTxns()>[refresh]</span></h2>
+<div id=txns></div>
+
 <pre id=out>ready.</pre>
 <script>
 let ref=null,key='super-secret-key-change-this';
-const o=d=>document.getElementById('out').textContent=JSON.stringify(d,null,2);
-async function pre(){const r=await fetch('/preauth',{method:'POST',headers:{'Content-Type':'application/json','X-API-KEY':key},body:JSON.stringify({card_no:card.value,exp:exp.value,cvv:cvv.value,amount:+amt.value,protocol:proto.value})});const d=await r.json();ref=d.ref;o(d);document.getElementById('s2').classList.remove('hidden');}
-async function comp(){const r=await fetch('/complete',{method:'POST',headers:{'Content-Type':'application/json','X-API-KEY':key},body:JSON.stringify({ref,approval_code:code.value})});o(await r.json());}
+const H={'Content-Type':'application/json','X-API-KEY':key};
+const o=(d,err)=>{const el=document.getElementById('out');el.className=err?'err':'';el.textContent=JSON.stringify(d,null,2);};
+const g=id=>document.getElementById(id);
+async function j(u,op){const r=await fetch(u,op);return r.json();}
+async function pre(){
+  const d=await j('/preauth',{method:'POST',headers:H,body:JSON.stringify({card_no:g('card').value,exp:g('exp').value,cvv:g('cvv').value,amount:+g('amt').value,protocol:g('proto').value})});
+  o(d,!!d.error);
+  if(d.ref){ref=d.ref;g('code').value=d.approval_code;g('s2').classList.remove('hidden');}
+  else g('s2').classList.add('hidden');
+}
+async function comp(){
+  const d=await j('/complete',{method:'POST',headers:H,body:JSON.stringify({ref,approval_code:g('code').value})});
+  o(d,!!d.error);
+  if(d.released){g('s2').classList.add('hidden');ref=null;loadTxns();loadCards();}
+}
+async function addCard(){
+  const d=await j('/cards',{method:'POST',headers:H,body:JSON.stringify({card_no:g('nc').value,exp:g('nexp').value,cvv:g('ncvv').value,holder:g('nholder').value,balance:+g('nbal').value})});
+  o(d,!!d.error);loadCards();
+}
+async function loadCards(){
+  const d=await j('/cards',{headers:H});
+  g('cards').innerHTML=(Array.isArray(d)?d:[]).map(c=>'<div class=card>'+c.card_no+' | '+c.exp+' | bal:'+c.balance+' | <b>'+c.status+'</b></div>').join('')||'<div class=small>no cards</div>';
+}
+async function loadTxns(){
+  const d=await j('/transactions',{headers:H});
+  g('txns').innerHTML=(Array.isArray(d)?d:[]).slice(0,10).map(t=>'<div class=card>'+t.ref+' | '+t.amount+' | '+t.protocol+' | '+t.status+'</div>').join('')||'<div class=small>no txns</div>';
+}
+loadCards();loadTxns();
 </script></body></html>`;
 app.get('/',(_,res)=>res.send(HTML));
 
